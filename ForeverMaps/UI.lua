@@ -471,6 +471,37 @@ function UI:ShowWelcome()
 end
 
 -- ---------------------------------------------------------------- world map
+-- OpenMap (stitched world map) support. It registers its own canvas click handler at priority
+-- 1000 that takes every right-click (zoom out), and its art covers the canvas above the map's
+-- own textures; the map underneath is only the part the view is on. So while it is showing:
+-- our handler runs first (higher priority), positions come from its API, and route lines sit
+-- on a layer above its art.
+local OM_PRIORITY = 2000
+local GAME_CONT = { [0] = 0, [1] = 1, [2] = 2991, [3] = 2997 } -- R.CONT_CODE reversed
+local function OM()
+    local api = rawget(_G, "OpenMapAPI")
+    if type(api) == "table" and api.major == 1 and (api.version or 0) >= 3
+        and type(api.IsStitched) == "function" and api.IsStitched() then
+        return api
+    end
+end
+UI.OpenMap = OM
+
+-- The zone map and position under the cursor on OpenMap's stitched map, else the click's own.
+local function clickPoint(map, cx, cy)
+    local api = OM()
+    if api then
+        local u, v = api.CursorPosition()
+        local mapID = u and api.MapAt(u, v)
+        if mapID then
+            local x, y = api.MapFromWorld(mapID, u, v)
+            if x then return mapID, x, y end
+        end
+        return
+    end
+    return map:GetMapID(), cx, cy
+end
+
 function UI:HookWorldMap()
     if self.mapHooked or not WorldMapFrame then return end
     self.mapHooked = true
@@ -485,17 +516,30 @@ function UI:HookWorldMap()
         Core:SetDestinationAtMap(menu.mapID, menu.nx, menu.ny)
         UI:Show()
     end)
+    local passing = false
     local out = CreateFrame("Button", nil, menu)
     out:SetSize(120, 20); out:SetPoint("TOP", 0, -27)
     out.t = label(out, nil, "Zoom out"); out.t:SetPoint("LEFT", 6, 0)
     out:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
-    out:SetScript("OnClick", function() menu:Hide(); WorldMapFrame:NavigateToParentMap() end)
+    out:SetScript("OnClick", function()
+        menu:Hide()
+        if menu.openMap and WorldMapFrame.ProcessCanvasClickHandlers then
+            -- hand the right-click to OpenMap's own zoom out (it reads the cursor, still on the spot)
+            passing = true
+            pcall(WorldMapFrame.ProcessCanvasClickHandlers, WorldMapFrame, "RightButton", menu.cx or 0.5, menu.cy or 0.5)
+            passing = false
+        else
+            WorldMapFrame:NavigateToParentMap()
+        end
+    end)
     self.pinMenu = menu
     WorldMapFrame:AddCanvasClickHandler(function(map, btn, cx, cy)
+        if passing then return false end
         if btn == "RightButton" then
-            local mapID = map:GetMapID()
-            if not Core:MapToWorld(mapID, cx, cy) then return false end
-            menu.mapID, menu.nx, menu.ny = mapID, cx, cy
+            local mapID, nx, ny = clickPoint(map, cx, cy)
+            if not mapID or not Core:MapToWorld(mapID, nx, ny) then menu:Hide(); return false end
+            menu.mapID, menu.nx, menu.ny = mapID, nx, ny
+            menu.cx, menu.cy, menu.openMap = cx, cy, OM() ~= nil
             local scale = UIParent:GetEffectiveScale()
             local mx, my = GetCursorPosition()
             menu:ClearAllPoints()
@@ -505,11 +549,38 @@ function UI:HookWorldMap()
         end
         menu:Hide()
         return false
-    end)
+    end, OM_PRIORITY)
     hooksecurefunc(WorldMapFrame, "OnMapChanged", function() UI:DrawMapRoute() end)
     WorldMapFrame:HookScript("OnShow", function() UI:DrawMapRoute() end)
     WorldMapFrame:HookScript("OnHide", function() menu:Hide() end)
     self.mapLines = {}
+    self:HookOpenMap()
+end
+
+-- Redraw when OpenMap's view pans/zooms or it switches between its map and Blizzard's.
+function UI:HookOpenMap()
+    local api = rawget(_G, "OpenMapAPI")
+    if self.omHooked or type(api) ~= "table" or api.major ~= 1 or type(api.RegisterCallback) ~= "function" then return end
+    self.omHooked = true
+    local owner = {}
+    function owner.Redraw() if UI.pinMenu then UI.pinMenu:Hide() end; UI:DrawMapRoute() end
+    pcall(api.RegisterCallback, owner, "OpenMap_ViewChanged", "Redraw")
+    pcall(api.RegisterCallback, owner, "OpenMap_StitchedChanged", "Redraw")
+end
+
+-- The frame route lines are drawn on: the canvas itself, or (OpenMap) a layer over its art.
+function UI:MapLayer(canvas, api)
+    local layer = self.mapLayer
+    if not layer then
+        layer = CreateFrame("Frame", nil, canvas)
+        layer:SetAllPoints(canvas)
+        if layer.EnableMouse then layer:EnableMouse(false) end
+        self.mapLayer = layer
+    end
+    local top = api and api.ArtTopLevel and api.ArtTopLevel()
+    if top and layer.SetFrameLevel then layer:SetFrameLevel(top + 1) end
+    layer:Show()
+    return layer
 end
 
 -- Draw the active route on the world map canvas as line segments.
@@ -519,8 +590,13 @@ function UI:DrawMapRoute()
     local r = Core:Current()
     if not r then return end
     local canvas = WorldMapFrame:GetCanvas()
+    local api = OM()
+    local layer = self:MapLayer(canvas, api)
     local mapID = WorldMapFrame:GetMapID()
     local w, h = canvas:GetWidth(), canvas:GetHeight()
+    -- OpenMap: points off the map underneath are still in view, so keep them (within reason)
+    local lo, hi = -0.05, 1.05
+    if api then lo, hi = -4, 5 end
     local used = 0
     local COLORS = { run = { 0.3, 0.8, 1 }, fly = { 1, 0.82, 0.25 }, boat = { 0.4, 1, 0.5 }, zeppelin = { 0.4, 1, 0.5 }, tram = { 0.8, 0.6, 1 } }
     for k = Core.step, #r.steps do
@@ -530,13 +606,19 @@ function UI:DrawMapRoute()
         local last
         for j = 1, #pts do
             local p = pts[j]
-            local nx, ny = Core:WorldToMap(mapID, R.Continent(p), W.nx[p], W.ny[p])
-            if nx and nx >= -0.05 and nx <= 1.05 and ny >= -0.05 and ny <= 1.05 then
+            local nx, ny
+            if api then
+                local gc = GAME_CONT[R.Continent(p)]
+                if gc then nx, ny = api.CanvasFromWorldPos(gc, W.nx[p], W.ny[p]) end
+            else
+                nx, ny = Core:WorldToMap(mapID, R.Continent(p), W.nx[p], W.ny[p])
+            end
+            if nx and nx >= lo and nx <= hi and ny >= lo and ny <= hi then
                 if last and (math.abs(nx - last[1]) + math.abs(ny - last[2]) > 0.004 or j == #pts) then
                     used = used + 1
                     local l = self.mapLines[used]
                     if not l then
-                        l = canvas:CreateLine(nil, "OVERLAY")
+                        l = layer:CreateLine(nil, "OVERLAY")
                         l:SetTexture("Interface\\Buttons\\WHITE8X8")
                         self.mapLines[used] = l
                     end

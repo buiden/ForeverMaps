@@ -40,6 +40,7 @@ function frameMT.Disable(self) self.enabled = false end
 function frameMT.GetWidth(self) return self.w or 1000 end
 function frameMT.GetHeight(self) return self.h or 667 end
 function frameMT.SetSize(self, w, h) self.w, self.h = w, h end
+function frameMT.SetFrameLevel(self, l) self.level = l end
 function frameMT.SetHeight(self, h) self.h = h end
 function frameMT.GetStringHeight(self) local n = math.max(1, math.ceil(#(self.text or "") / 45)); return 12 * n end
 function frameMT.SetRotation(self, r) self.rotation = r end
@@ -88,14 +89,21 @@ local clickHandlers = {}
 WorldMapFrame = newFrame("Frame", "WorldMapFrame")
 WorldMapFrame.shown = false
 WorldMapFrame.mapID = 1429
-function WorldMapFrame:AddCanvasClickHandler(fn) clickHandlers[#clickHandlers + 1] = fn end
+-- like Blizzard's registry: highest priority first, stops at the first handler returning true
+function WorldMapFrame:AddCanvasClickHandler(fn, prio)
+    clickHandlers[#clickHandlers + 1] = { fn = fn, prio = prio or 0 }
+    table.sort(clickHandlers, function(a, b) return a.prio > b.prio end)
+end
+function WorldMapFrame:ProcessCanvasClickHandlers(btn, x, y)
+    for _, h in ipairs(clickHandlers) do if h.fn(self, btn, x, y) then return true end end
+    return false
+end
 function WorldMapFrame:GetMapID() return self.mapID end
 function WorldMapFrame:GetCanvas() self.canvas = self.canvas or newFrame("Frame"); return self.canvas end
 function WorldMapFrame:OnMapChanged() end
 function WorldMapFrame:NavigateToParentMap() self.navigatedUp = true end
 local function rightClick(nx, ny)
-    for _, h in ipairs(clickHandlers) do if h(WorldMapFrame, "RightButton", nx, ny) then return true end end
-    return false
+    return WorldMapFrame:ProcessCanvasClickHandlers("RightButton", nx, ny)
 end
 
 local function fire(e, ...)
@@ -261,10 +269,68 @@ local pinMenu = _G.ForeverMapsPinMenu
 Core:SetDestinationAtMap(pinMenu.mapID, pinMenu.nx, pinMenu.ny)
 ok(Core.dest and Core.dest.name == "Pin in Westfall", "pin destination set: " .. tostring(Core.dest and Core.dest.name))
 UI:DrawMapRoute()
-ok((WorldMapFrame.canvas.lines or 0) > 0, "route line drawn on world map: " .. tostring(WorldMapFrame.canvas.lines))
+ok((UI.mapLayer and UI.mapLayer.lines or 0) > 0, "route line drawn on world map: " .. tostring(UI.mapLayer and UI.mapLayer.lines))
 WorldMapFrame.mapID = 99999
 ok(not rightClick(0.5, 0.5), "unknown map: right-click falls through to normal zoom-out")
 Core:ClearRoute()
+
+
+-- ---------------------------------------------------------------- 6b. OpenMap (stitched world map)
+do
+    -- OpenMap's real behaviour: a click handler at priority 1000 that takes every click, art above
+    -- the canvas, and the map underneath only the part the view is on (here Elwynn while we look
+    -- at Westfall). API v4 as in openmap-world/openmap.
+    local om = { stitched = true, zoomOuts = 0, cbs = {} }
+    WorldMapFrame:AddCanvasClickHandler(function(_, btn)
+        if not om.stitched then return false end
+        if btn == "RightButton" then om.zoomOuts = om.zoomOuts + 1 end
+        return true
+    end, 1000)
+    local westfall = zoneMap("Westfall")
+    OpenMapAPI = { major = 1, version = 4,
+        IsStitched = function() return om.stitched end,
+        CursorPosition = function() return 0.40, 0.70 end,
+        MapAt = function() return westfall end,
+        MapFromWorld = function(id, u, v) return 0.56, 0.48 end,
+        ArtTopLevel = function() return 2100 end,
+        CanvasFromWorldPos = function(c, x, y) om.asked = (om.asked or 0) + 1; om.cont = c; return 1.6, -0.3 + (om.asked % 7) * 0.2 end,
+        RegisterCallback = function(owner, ev, m) om.cbs[ev] = function(...) owner[m](owner, ...) end end,
+    }
+    UI.omHooked = nil; UI:HookOpenMap()
+    WorldMapFrame.mapID = zoneMap("Elwynn Forest")
+    _G.ForeverMapsPinMenu:Hide()
+    ok(rightClick(0.1, 0.1) and _G.ForeverMapsPinMenu:IsShown(), "OpenMap: right-click still opens Route here")
+    ok(om.zoomOuts == 0, "OpenMap: its zoom-out doesn't eat the right-click first")
+    local pm = _G.ForeverMapsPinMenu
+    ok(pm.mapID == westfall and pm.nx == 0.56 and pm.ny == 0.48, "OpenMap: pin is the zone under the cursor, not the map underneath: " .. tostring(pm.mapID))
+    Core:SetDestinationAtMap(pm.mapID, pm.nx, pm.ny)
+    ok(Core.dest and Core.dest.name == "Pin in Westfall", "OpenMap: pin destination set in Westfall")
+    -- Zoom out on our menu hands the click to OpenMap
+    local zo = 0
+    for _, c in ipairs(allFrames) do if c.parent == pm and c.kind == "Button" then zo = zo + 1; if zo == 2 then c:Click() end end end
+    ok(om.zoomOuts == 1 and not WorldMapFrame.navigatedUp, "OpenMap: Zoom out goes to OpenMap's zoom, once")
+    om.asked = 0; UI.mapLayer = nil
+    WorldMapFrame.canvas = nil
+    UI.mapLines = {}
+    UI:DrawMapRoute()
+    local lines = UI.mapLayer and UI.mapLayer.lines or 0
+    ok((om.asked or 0) > 0 and om.cont == 0, "OpenMap: route placed by OpenMap's CanvasFromWorldPos on Eastern Kingdoms: " .. tostring(om.cont))
+    ok(lines > 0, "OpenMap: route lines drawn off the map underneath too: " .. lines)
+    ok(UI.mapLayer.level == 2101, "OpenMap: route layer above OpenMap's art: " .. tostring(UI.mapLayer.level))
+    local before = om.asked
+    om.cbs.OpenMap_ViewChanged(0.4, 0.7, 3)
+    ok(om.asked > before, "OpenMap: route redrawn when its view pans/zooms")
+    -- OpenMap installed but showing Blizzard's map: old behaviour
+    om.stitched = false
+    WorldMapFrame.mapID = westfall; WorldMapFrame.navigatedUp = nil
+    ok(rightClick(0.56, 0.48) and pm.mapID == westfall and pm.nx == 0.56, "OpenMap off: right-click uses the click on the map")
+    om.asked = 0; UI:DrawMapRoute()
+    ok(om.asked == 0, "OpenMap off: route placed on Blizzard's map as before")
+    Core:ClearRoute()
+    OpenMapAPI = nil
+    for i = #clickHandlers, 1, -1 do if clickHandlers[i].prio == 1000 then table.remove(clickHandlers, i) end end
+    pm:Hide()
+end
 
 -- ---------------------------------------------------------------- 7. horde
 S.faction = "Horde"
